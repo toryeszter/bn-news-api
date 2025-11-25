@@ -14,7 +14,10 @@ from lxml import html
 import trafilatura
 from docx import Document
 from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.oxml.ns import qn as _qn          # <-- alias: _qn
+from docx.enum.text import WD_BREAK         # <-- oldaltöréshez
+from docx.shared import Pt                  # <-- betűmérethez
+
 
 # ===== Konfiguráció =====
 TEMPLATE_PATH = "ceges_sablon.docx"   # tedd ezt a fájlt a main.py mellé
