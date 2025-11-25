@@ -21,7 +21,7 @@ TEMPLATE_PATH = "ceges_sablon.docx"   # tedd ezt a fájlt a main.py mellé
 REQUIRED_COLS = {"Rovat", "Link"}
 APP_SECRET = '007'              # állíts be erős jelszót, és ugyanazt tedd a Code.gs payloadjába
 
-app = FastAPI(title="BN News API", version="1.1")
+app = FastAPI()
 
 # ===== Utilities =====
 def csv_url(sheet_id: str, sheet_name: str) -> str:
@@ -30,7 +30,6 @@ def csv_url(sheet_id: str, sheet_name: str) -> str:
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0"," ")).strip()
 
-# Ad/boilerplate filters
 SENT_END_RE = re.compile(r'[.!?…]"?$')
 
 AD_PATTERNS = [
@@ -49,39 +48,35 @@ AD_PATTERNS = [
     r".*\b(getty images|shutterstock|reuters|associated press|ap photo|afp|epa)\b.*",
     r"^\s*back to intro\b",
     r"^\s*read article\b",
+    r"^érdekesnek találta.*hírlevelünkre",
+    r"^\s*hírlev[ée]l",
+    r"^\s*kapcsol[óo]d[óo] cikk(ek)?\b",
+    r"^\s*fot[óo]gal[ée]ria\b",
+    r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
 ]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
 
 def is_sentence_like(s: str) -> bool:
     s = s.strip()
-    return bool(SENT_END_RE.search(s)) or len(s) > 200  # nagyon hosszú bekezdés is „lezárt”-nak vehető
+    return bool(SENT_END_RE.search(s)) or len(s) > 200
 
 def clean_and_merge(paras: list[str]) -> list[str]:
-    """Reklám/ajánló kiszűrése + félmondatok összefűzése teljes mondattá."""
-    # 1) alap takarítás
     lines = []
     for p in paras:
         t = norm_space(p)
-        if not t:
-            continue
-        if JUNK_RE.search(t):
-            continue
-        # nagyon rövid szemét darabokat lökjük el (pl. magányos 'Kép:' stb.)
-        if len(t) < 35 and not t.endswith(":"):
-            continue
+        if not t: continue
+        if JUNK_RE.search(t): continue
+        if len(t) < 35 and not t.endswith(":"): continue
         lines.append(t)
 
-    # 2) félmondatok összefűzése
     merged, buf = [], ""
     for t in lines:
         buf = (buf + " " + t).strip() if buf else t
         if is_sentence_like(buf):
-            merged.append(buf)
-            buf = ""
-    if buf and len(buf) > 60:   # maradék, ha értelmes hosszú
+            merged.append(buf); buf = ""
+    if buf and len(buf) > 60:
         merged.append(buf)
 
-    # 3) biztos ami biztos: utótakarítás
     merged = [m for m in merged if not JUNK_RE.search(m)]
     return merged
 
@@ -104,8 +99,6 @@ def hu_date(d: datetime.date) -> str:
 
 # ===== Extraction =====
 def read_paras(url: str):
-    """Cikk kinyerése: Readability, majd Trafi; tisztítás + félmondat-összefűzés; (title, paragraphs)."""
-    # 1) Readability
     try:
         r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
         r.raise_for_status()
@@ -120,16 +113,10 @@ def read_paras(url: str):
     except Exception:
         pass
 
-    # 2) Trafi fallback
     try:
         dl = trafilatura.fetch_url(url)
-        text = trafilatura.extract(
-            dl,
-            include_comments=False,
-            include_tables=False,
-            favor_recall=True,   # több szöveg
-            no_fallback=False
-        ) if dl else None
+        text = trafilatura.extract(dl, include_comments=False, include_tables=False,
+                                   favor_recall=True, no_fallback=False) if dl else None
         paras = []
         if text:
             blocks = [norm_space(b) for b in re.split(r"\n\s*\n", text.replace("\r\n","\n"))]
@@ -146,21 +133,30 @@ def read_paras(url: str):
     except Exception:
         return "", []
 
-# ===== API Models =====
+def pick_lead(paras: list[str]) -> str:
+    if not paras: return ""
+    text = paras[0]
+    parts = re.split(r"(?<=[.!?…])\s+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts: return text
+    lead = parts[0]
+    if len(parts) >= 2 and len(lead) < 220:
+        lead = lead + " " + parts[1]
+    return lead.strip()
+
+# ===== Models =====
 class Payload(BaseModel):
     sheet_id: str
-    worksheet: str   # "YYYY-MM-DD"
-    rovat: str       # "Industrials"
+    worksheet: str
+    rovat: str
     secret: str | None = None
 
 # ===== Endpoint =====
 @app.post("/generate")
 def generate(p: Payload):
-    # Auth
     if APP_SECRET and (p.secret != APP_SECRET):
         raise HTTPException(401, "Unauthorized")
 
-    # Read sheet
     try:
         df = pd.read_csv(csv_url(p.sheet_id, p.worksheet))
     except Exception as e:
@@ -176,16 +172,20 @@ def generate(p: Payload):
     if df.empty:
         raise HTTPException(404, f"No links for rovat '{p.rovat}' on sheet '{p.worksheet}'")
 
-    # Start doc (use template if exists)
     doc = Document(TEMPLATE_PATH) if os.path.exists(TEMPLATE_PATH) else Document()
 
-    # Top heading: "Weekly News | {rovat}" — bold
+    # Főcím: erőltetett félkövér + Heading 1
     t = doc.add_paragraph()
+    t.style = 'Heading 1'  # a sablonban jellemzően félkövér
     r = t.add_run(f"Weekly News | {p.rovat}")
     r.bold = True
+    try:
+        r.style = 'Strong'  # karakter stílus, ha elérhető
+    except Exception:
+        pass
     r.font.size = Pt(12.5)
 
-    # Date line
+    # Dátum (normál)
     try:
         y,m,d = [int(x) for x in p.worksheet.split("-")]
         monday = datetime.date(y,m,d)
@@ -193,7 +193,7 @@ def generate(p: Payload):
         monday = datetime.date.today()
     doc.add_paragraph(hu_date(monday))
 
-    # Intro anchor + index
+    # Intro horgony
     add_bm(doc.add_paragraph(), "INTRO")
 
     rows = df.reset_index(drop=True)
@@ -203,16 +203,17 @@ def generate(p: Payload):
         if not title:
             u = urlparse(url); title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # numbered title in intro
+        # Intro sor címmel — félkövér + Strong
         intro_line = doc.add_paragraph()
-        intro_line.add_run(f"{i+1}. {title}")
+        intro_run = intro_line.add_run(f"{i+1}. {title}")
+        intro_run.bold = True
+        try:
+            intro_run.style = 'Strong'
+        except Exception:
+            pass
 
-        # choose a lead (first longish paragraph)
-        lead = ""
-        for ptxt in paras:
-            if len(ptxt) >= 60 and not ptxt.endswith(":"):
-                lead = ptxt
-                break
+        # Lead (1–2 teljes mondat)
+        lead = pick_lead(paras)
         if lead:
             doc.add_paragraph(lead)
 
@@ -220,58 +221,59 @@ def generate(p: Payload):
         add_link(link_p, "read article >>>", f"cikk_{i}")
         doc.add_paragraph("")
 
-    # Articles
-    doc.add_paragraph("")
+    # Intro után kötelező oldaltörés
+    br = doc.add_paragraph().add_run()
+    br.add_break(WD_BREAK.PAGE)
+
+    # „Articles” szekciócím — félkövér + Heading 2
     sec = doc.add_paragraph()
+    sec.style = 'Heading 2'
     sr = sec.add_run("Articles")
     sr.bold = True
+    try:
+        sr.style = 'Strong'
+    except Exception:
+        pass
 
+    # Cikkek
     for i, row in rows.iterrows():
         url = str(row["Link"]).strip()
         title, paras = read_paras(url)
         if not title:
             u = urlparse(url); title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # Title (bold)
+        # Cikk cím — félkövér + Heading 2
         ptitle = doc.add_paragraph()
+        ptitle.style = 'Heading 2'
         add_bm(ptitle, f"cikk_{i}")
         rr = ptitle.add_run(title)
         rr.bold = True
+        try:
+            rr.style = 'Strong'
+        except Exception:
+            pass
 
-        # Source line
+        # Forrás
         dom = urlparse(url).netloc.lower().replace("www.","")
         doc.add_paragraph(f"Source: {dom}")
 
-        # Lead + body
-        lead_written = False
-        for j, para in enumerate(paras):
-            if not lead_written:
-                if len(para) >= 60 and not para.endswith(":"):
-                    doc.add_paragraph(para)
-                    lead_written = True
-                elif j == 0:
-                    doc.add_paragraph(para)
-                    lead_written = True
-            else:
-                doc.add_paragraph(para)
+        # Törzs
+        for para in paras:
+            doc.add_paragraph(para)
 
-        # Back link
+        # Vissza link
         back = doc.add_paragraph()
         add_link(back, "back to intro >>>", "INTRO")
 
-        # Page break after each article except last
+        # Oldaltörés cikkek között
         if i != len(rows) - 1:
-            br = doc.add_paragraph().add_run()
-            br.add_break(WD_BREAK.PAGE)
+            br2 = doc.add_paragraph().add_run()
+            br2.add_break(WD_BREAK.PAGE)
 
-    # Save to bytes and return
     fname = f"BN_{p.rovat} news_{monday.strftime('%Y%m%d')}.docx"
-    buf = io.BytesIO()
-    doc.save(buf); buf.seek(0)
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0)
     return Response(
         content=buf.read(),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"X-Filename": fname}
     )
-
-
