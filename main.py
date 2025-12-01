@@ -11,6 +11,7 @@ from readability import Document as ReadabilityDoc
 from lxml import html
 import trafilatura
 
+from pathlib import Path
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
