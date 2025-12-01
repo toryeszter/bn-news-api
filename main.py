@@ -18,7 +18,8 @@ from docx.shared import Pt              # <-- KELL a betűmérethez
 from docx.enum.text import WD_BREAK     # <-- KELL az oldaltöréshez
 
 # ===== Konfiguráció =====
-TEMPLATE_PATH = "ceges_sablon.docx"
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_PATH = str(BASE_DIR / "ceges_sablon.docx")
 REQUIRED_COLS = {"Rovat", "Link"}
 APP_SECRET = "007"     # legyen string és egyezzen az Apps Scriptben
 
