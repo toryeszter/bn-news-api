@@ -168,6 +168,13 @@ class Payload(BaseModel):
 # ===== Endpoint =====
 @app.post("/generate")
 def generate(p: Payload):
+    # log – sablon elérhetőség
+    print("TEMPLATE_PATH:", TEMPLATE_PATH, "exists:", os.path.exists(TEMPLATE_PATH), file=sys.stderr)
+
+
+
+@app.post("/generate")
+def generate(p: Payload):
     # auth
     if APP_SECRET and (p.secret != APP_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
