@@ -45,6 +45,10 @@ AD_PATTERNS = [
     r"^érdekesnek találta.*hírlevelünkre", r"^\s*hírlev[ée]l",
     r"^\s*kapcsol[óo]d[óo] cikk(ek)?\b", r"^\s*fot[óo]gal[ée]ria\b",
     r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
+    r"^\s*Csapjunk bele a közepébe",   # Portfolio "hirtelen kezdés"
+    r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
+]
+
 ]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
 
