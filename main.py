@@ -192,9 +192,9 @@ def generate(p: Payload):
     # DOCX indul
     doc = Document(TEMPLATE_PATH) if os.path.exists(TEMPLATE_PATH) else Document()
 
-    # Főcím – félkövér + Heading 1
+    # Főcím – félkövér + Heading 11
     title_p = doc.add_paragraph()
-    title_p.style = 'Heading 1'
+    title_p.style = 'Heading 11'
     run = title_p.add_run(f"Weekly News | {p.rovat}")
     run.bold = True
     run.font.size = Pt(12.5)
@@ -237,9 +237,9 @@ def generate(p: Payload):
     # Intro után oldaltörés
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
-    # „Articles” cím – félkövér + Heading 2
+    # „Articles” cím – félkövér + Heading 21
     sec = doc.add_paragraph()
-    sec.style = 'Heading 2'
+    sec.style = 'Heading 21'
     sr = sec.add_run("Articles")
     sr.bold = True
 
@@ -251,9 +251,9 @@ def generate(p: Payload):
             u = urlparse(url)
             title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # Cikk cím – félkövér + Heading 2 + könyvjelző
+        # Cikk cím – félkövér + Heading 21 + könyvjelző
         ptitle = doc.add_paragraph()
-        ptitle.style = 'Heading 2'
+        ptitle.style = 'Heading 21'
         add_bm(ptitle, f"cikk_{i}")
         rr = ptitle.add_run(title)
         rr.bold = True
