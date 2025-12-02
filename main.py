@@ -48,8 +48,6 @@ AD_PATTERNS = [
     r"^\s*Csapjunk bele a közepébe",   # Portfolio "hirtelen kezdés"
     r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
 ]
-
-]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
 
 def is_sentence_like(s: str) -> bool:
