@@ -11,18 +11,16 @@ from readability import Document as ReadabilityDoc
 from lxml import html
 import trafilatura
 
-from pathlib import Path
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt              # <-- KELL a betűmérethez
-from docx.enum.text import WD_BREAK     # <-- KELL az oldaltöréshez
+from docx.shared import Pt              # betűméret
+from docx.enum.text import WD_BREAK     # oldaltörés
 
 # ===== Konfiguráció =====
-BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = str(BASE_DIR / "ceges_sablon.docx")
+TEMPLATE_PATH = "ceges_sablon.docx"
 REQUIRED_COLS = {"Rovat", "Link"}
-APP_SECRET = "007"     # legyen string és egyezzen az Apps Scriptben
+APP_SECRET = "007"     # egyezzen az Apps Scriptben
 
 app = FastAPI()
 
@@ -47,97 +45,8 @@ AD_PATTERNS = [
     r"^érdekesnek találta.*hírlevelünkre", r"^\s*hírlev[ée]l",
     r"^\s*kapcsol[óo]d[óo] cikk(ek)?\b", r"^\s*fot[óo]gal[ée]ria\b",
     r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
-    r"^\s*Csapjunk bele a közepébe",   # Portfolio "hirtelen kezdés"
-    r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
 ]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
-
-def domain_specific_extract(url: str, page_html: str):
-    try:
-        root = html.fromstring(page_html)
-        host = urlparse(url).netloc.lower()
-
-        def pick_lead_from_header(r):
-            # 1) meta description
-            m = r.xpath("//meta[@name='description']/@content")
-            for t in m:
-                t = norm_space(t)
-                if t:
-                    return t
-            # 2) tipikus lead/intro/standfirst p-k
-            lead_nodes = r.xpath(
-                "//p[contains(@class,'lead') or contains(@class,'intro') or contains(@class,'standfirst')]"
-            )
-            for el in lead_nodes:
-                t = norm_space(el.text_content())
-                if t:
-                    return t
-            return None
-
-        # --- vg.hu ---
-        if "vg.hu" in host:
-            candidates = [
-                "//article",
-                "//div[contains(@class,'article')]",
-                "//div[contains(@class,'content')]",
-                "//div[@id='content']",
-            ]
-            # próbáljunk leadet kifejezetten a fejlécrészből
-            vg_lead = pick_lead_from_header(root)
-
-            for c in candidates:
-                nodes = root.xpath(c)
-                if not nodes:
-                    continue
-                blocks = []
-                for node in nodes:
-                    blocks.extend(
-                        extract_text_blocks(
-                            node, [".//p", ".//li", ".//h2", ".//h3", ".//h4"]
-                        )
-                    )
-                # ha találtunk leadet, tegyük a lista elejére (dupla ellenőrzéssel)
-                if vg_lead:
-                    if not blocks or norm_space(blocks[0]) != vg_lead:
-                        blocks.insert(0, vg_lead)
-
-                if blocks:
-                    title = norm_space("".join(root.xpath("string(//h1)")))
-                    return title, clean_and_merge(blocks)
-
-        # --- portfolio.hu ---  (ugyanez a lead logika itt is jól jön)
-        if "portfolio.hu" in host:
-            candidates = [
-                "//div[@id='article-body']",
-                "//div[contains(@class,'article-body')]",
-                "//article",
-                "//div[contains(@class,'cikk-torzs') or contains(@class,'cikk-body')]",
-            ]
-            pf_lead = pick_lead_from_header(root)
-
-            for c in candidates:
-                nodes = root.xpath(c)
-                if not nodes:
-                    continue
-                blocks = []
-                for node in nodes:
-                    blocks.extend(
-                        extract_text_blocks(
-                            node, [".//p", ".//li", ".//h2", ".//h3", ".//h4"]
-                        )
-                    )
-                if pf_lead:
-                    if not blocks or norm_space(blocks[0]) != pf_lead:
-                        blocks.insert(0, pf_lead)
-
-                if blocks:
-                    title = norm_space("".join(root.xpath("string(//h1)")))
-                    return title, clean_and_merge(blocks)
-
-    except Exception:
-        pass
-
-    return None, None
 
 def is_sentence_like(s: str) -> bool:
     s = s.strip()
@@ -170,16 +79,6 @@ def clean_and_merge(paras: list[str]) -> list[str]:
     merged = [m for m in merged if not JUNK_RE.search(m)]
     return merged
 
-def extract_text_blocks(node, xpaths):
-    """Kiveszi a p/li/h2..h4 szövegeket egy node-ból, normálisan tisztítva."""
-    blocks = []
-    for xp in xpaths:
-        for el in node.xpath(xp):
-            t = norm_space(el.text_content())
-            if t:
-                blocks.append(t)
-    return blocks
-
 def add_bm(paragraph, name: str):
     """Belső könyvjelző beszúrása."""
     run = paragraph.add_run()
@@ -202,18 +101,10 @@ def hu_date(d: datetime.date) -> str:
 
 # ===== Cikk kinyerés =====
 def read_paras(url: str):
-    # Próbáljuk először domain-specifikusan (VG/Portfolio),
-    # és csak utána Readability / trafilatura fallback.
+    # 1) Readability
     try:
-        r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
         r.raise_for_status()
-
-        # --- VG/Portfolio-specifikus kivonás ---
-        t_dom, paras_dom = domain_specific_extract(url, r.text)
-        if paras_dom:
-            return (t_dom or ""), paras_dom
-
-        # --- Readability fallback ---
         rd = ReadabilityDoc(r.text)
         title = (rd.short_title() or "").strip()
         root = html.fromstring(rd.summary())
@@ -222,11 +113,10 @@ def read_paras(url: str):
         cleaned = clean_and_merge(paras)
         if cleaned:
             return title, cleaned
-
     except Exception:
         pass
 
-    # --- trafilatura fallback ---
+    # 2) trafilatura
     try:
         dl = trafilatura.fetch_url(url)
         text = trafilatura.extract(
@@ -252,7 +142,7 @@ def read_paras(url: str):
         return title, cleaned
     except Exception:
         return "", []
-        
+
 def pick_lead(paras: list[str]) -> str:
     """Az első 1–2 TELJES mondat a bevezetőhöz – félmondatot nem hagyunk."""
     if not paras:
@@ -302,10 +192,16 @@ def generate(p: Payload):
 
     # Főcím – félkövér + Heading 1
     title_p = doc.add_paragraph()
-    title_p.style = 'Heading 1'
+    try:
+        title_p.style = 'Heading 1'  # legyen a sablonban!
+    except Exception:
+        pass
     run = title_p.add_run(f"Weekly News | {p.rovat}")
     run.bold = True
-    run.font.size = Pt(12.5)
+    try:
+        run.font.size = Pt(12.5)
+    except Exception:
+        pass
 
     # Dátum
     try:
@@ -328,7 +224,7 @@ def generate(p: Payload):
             u = urlparse(url)
             title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # félkövér cím
+        # félkövér cím sor
         intro_line = doc.add_paragraph()
         r = intro_line.add_run(f"{i+1}. {title}")
         r.bold = True
@@ -343,11 +239,17 @@ def generate(p: Payload):
         doc.add_paragraph("")
 
     # Intro után oldaltörés
-    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    try:
+        doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    except Exception:
+        pass
 
     # „Articles” cím – félkövér + Heading 2
     sec = doc.add_paragraph()
-    sec.style = 'Heading 2'
+    try:
+        sec.style = 'Heading 2'
+    except Exception:
+        pass
     sr = sec.add_run("Articles")
     sr.bold = True
 
@@ -361,7 +263,10 @@ def generate(p: Payload):
 
         # Cikk cím – félkövér + Heading 2 + könyvjelző
         ptitle = doc.add_paragraph()
-        ptitle.style = 'Heading 2'
+        try:
+            ptitle.style = 'Heading 2'
+        except Exception:
+            pass
         add_bm(ptitle, f"cikk_{i}")
         rr = ptitle.add_run(title)
         rr.bold = True
@@ -380,7 +285,10 @@ def generate(p: Payload):
 
         # Oldaltörés cikkek között
         if i != len(rows) - 1:
-            doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+            try:
+                doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+            except Exception:
+                pass
 
     # Visszaküldés
     fname = f"BN_{p.rovat} news_{monday.strftime('%Y%m%d')}.docx"
