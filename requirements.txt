@@ -7,3 +7,4 @@ lxml
 requests
 trafilatura
 python-dateutil
+google-generativeai
