@@ -117,6 +117,24 @@ def add_link(paragraph, text: str, anchor: str):
 def hu_date(d: datetime.date) -> str:
     return d.strftime("%Y.%m.%d.")
 
+from datetime import date, timedelta
+
+def monday_of(isodate_str: str) -> date:
+    y, m, d = [int(x) for x in isodate_str.split("-")]
+    dt = date(y, m, d)
+    # biztosítsuk, hogy tényleg hétfő legyen (ha valaki véletlen más napra nevezte el)
+    return dt if dt.weekday() == 0 else (dt - timedelta(days=dt.weekday()))
+
+def week_range_from_monday(monday: date):
+    start = monday
+    end = monday + timedelta(days=6)
+    return start.isoformat(), end.isoformat()
+
+def last_7_days():
+    today = date.today()
+    start = today - timedelta(days=6)
+    return start.isoformat(), today.isoformat()
+
 # ===== Cikk kinyerés (meglévő logika) =====
 def read_paras(url: str):
     # 1) Readability
@@ -182,11 +200,91 @@ class GeneratePayload(BaseModel):
     secret: str | None = None
 
 class ChatPayload(BaseModel):
+    # a Sheets most ezeket küldi:
+    sheet_id: str | None = None
+    worksheet: str | None = None
     rovat: str
-    query: str
-    date_from: str    # "YYYY-MM-DD"
-    date_to: str      # "YYYY-MM-DD"
+    query: str | None = ""
+    use_emis: bool | None = False
+    # opcionálisan küldhető közvetlen dátumablak is:
+    date_from: str | None = None
+    date_to: str | None = None
     n: int | None = 10
+
+    # 1) dátumablak meghatározás
+    if p.date_from and p.date_to:
+        d_from, d_to = p.date_from.strip(), p.date_to.strip()
+    elif p.worksheet:
+        try:
+            mon = monday_of(p.worksheet.strip())
+            d_from, d_to = week_range_from_monday(mon)  # hétfő–vasárnap
+        except Exception:
+            d_from, d_to = last_7_days()
+    else:
+        d_from, d_to = last_7_days()
+
+    # 2) elemszám
+    n = max(1, min(int(p.n or 10), 20))
+
+    # 3) prompt
+    prompt = _build_links_prompt(
+        rovat=p.rovat.strip(),
+        q=(p.query or "").strip(),
+        date_from=d_from,
+        date_to=d_to,
+        n=n
+    )
+
+    # 4) modell hívás
+    try:
+        resp = _GEMINI_MODEL.generate_content(prompt)
+        txt = (resp.text or "").strip()
+    except Exception as e:
+        raise HTTPException(500, f"Gemini error: {e}")
+
+    # 5) JSON értelmezés
+    import json
+    try:
+        items = json.loads(txt)
+        if not isinstance(items, list):
+            raise ValueError("Not a list")
+    except Exception:
+        raise HTTPException(502, "Model returned non-JSON output.")
+
+    # 6) szűrés/normalizálás és a kívánt kulcsnév: 'sources'
+    out = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        url = (it.get("url") or "").strip()
+        title = (it.get("title") or "").strip()
+        source = (it.get("source") or "").strip()
+        published = (it.get("published") or "").strip()
+        if not url or not _URL_RE.match(url):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        if not source:
+            try:
+                source = urlparse(url).netloc.replace("www.", "")
+            except Exception:
+                source = ""
+        out.append({
+            "title": title,
+            "url": url,
+            "source": source,
+            "published": published
+        })
+        if len(out) >= n:
+            break
+
+    if not out:
+        raise HTTPException(404, "No links produced by model.")
+
+    # kompatibilitás: az Apps Script 'json.sources'-t olvas
+    return {"ok": True, "date_from": d_from, "date_to": d_to, "sources": out, "items": out}
 
 # ===== Health =====
 @app.get("/health")
@@ -317,7 +415,7 @@ def generate(p: GeneratePayload):
         headers={"X-Filename": fname}
     )
 
-# ===== Gemini-alapú link-kereső =====
+# ===== Gemini-alapú link-kereső (EGYETLEN, VÉGLEGES VERZIÓ) =====
 def _build_links_prompt(rovat: str, q: str, date_from: str, date_to: str, n: int) -> str:
     return f"""
 Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:
@@ -329,7 +427,9 @@ Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg n
 Követelmények:
 - Pontosan {n} különböző link.
 - Időablak: CSAK a megadott tartományból (FROM..TO, ISO dátum).
-- Forrásminőség: preferált hírportálok (portfolio.hu, vg.hu, g7.hu, hvg.hu, telex.hu, index.hu, reuters.com, bloomberg.com, ft.com, apnews.com, stb.).
+- Fókusz: Magyarországon történt, vagy Magyarországot érdemben érintő hírek.
+- Forrásminőség: preferált portálok (portfolio.hu, vg.hu, g7.hu, hvg.hu, telex.hu, index.hu,
+  reuters.com, bloomberg.com, ft.com, apnews.com stb.).
 - Kerüld: PR/advertorial, paywall preview, duplikált átvételek.
 - Téma: igazodjon a rovat témájához: "{rovat}".
 - Nyelv: magyar vagy angol.
@@ -349,16 +449,38 @@ def chat(p: ChatPayload):
     if not _GEMINI_MODEL:
         raise HTTPException(503, "Gemini API key missing on server.")
 
-    n = max(1, min(int(p.n or 10), 20))
-    prompt = _build_links_prompt(p.rovat.strip(), p.query.strip(), p.date_from.strip(), p.date_to.strip(), n)
+    # 1) dátumablak
+    if p.date_from and p.date_to:
+        d_from, d_to = p.date_from.strip(), p.date_to.strip()
+    elif p.worksheet:
+        try:
+            mon = monday_of(p.worksheet.strip())
+            d_from, d_to = week_range_from_monday(mon)  # hétfő–vasárnap
+        except Exception:
+            d_from, d_to = last_7_days()
+    else:
+        d_from, d_to = last_7_days()
 
+    # 2) elemszám
+    n = max(1, min(int(p.n or 10), 20))
+
+    # 3) prompt
+    prompt = _build_links_prompt(
+        rovat=p.rovat.strip(),
+        q=(p.query or "").strip(),
+        date_from=d_from,
+        date_to=d_to,
+        n=n
+    )
+
+    # 4) modell hívás
     try:
         resp = _GEMINI_MODEL.generate_content(prompt)
         txt = (resp.text or "").strip()
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {e}")
 
-    # Próbáljuk JSON-ként értelmezni – a modellnek strict JSON-t kértünk
+    # 5) JSON értelmezés
     import json
     try:
         items = json.loads(txt)
@@ -367,24 +489,24 @@ def chat(p: ChatPayload):
     except Exception:
         raise HTTPException(502, "Model returned non-JSON output.")
 
-    # Szűrés és normalizálás
+    # 6) szűrés/normalizálás
     out = []
     seen = set()
     for it in items:
-        if not isinstance(it, dict): 
+        if not isinstance(it, dict):
             continue
         url = (it.get("url") or "").strip()
         title = (it.get("title") or "").strip()
         source = (it.get("source") or "").strip()
         published = (it.get("published") or "").strip()
-        if not url or not _URL_RE.match(url): 
+        if not url or not _URL_RE.match(url):
             continue
-        if url in seen: 
+        if url in seen:
             continue
         seen.add(url)
         if not source:
             try:
-                source = urlparse(url).netloc.replace("www.","")
+                source = urlparse(url).netloc.replace("www.", "")
             except Exception:
                 source = ""
         out.append({"title": title, "url": url, "source": source, "published": published})
@@ -394,4 +516,6 @@ def chat(p: ChatPayload):
     if not out:
         raise HTTPException(404, "No links produced by model.")
 
-    return {"ok": True, "items": out}
+    # Apps Script kompatibilitás: 'sources' kell
+    return {"ok": True, "date_from": d_from, "date_to": d_to, "sources": out, "items": out}
+
