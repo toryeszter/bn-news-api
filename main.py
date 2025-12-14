@@ -1,9 +1,12 @@
-# main.py – BN News DOCX generátor (FastAPI)
-# ------------------------------------------
-# /generate JSON:
-# { "sheet_id":"<GOOGLE_SHEET_ID>", "worksheet":"YYYY-MM-DD", "rovat":"Industrials", "secret":"007" }
+# main.py – BN News DOCX generátor + AI link-kereső (FastAPI)
+# --------------------------------------------------------------------------------
+# /generate  -> DOCX (a meglévő működésed változatlanul megmarad)
+# /chat      -> Gemini 1.5 Flash segítségével JSON link-lista (csak ha van GEMINI_API_KEY)
+# /health    -> állapot teszt
+# --------------------------------------------------------------------------------
 
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os, io, re, datetime, requests, pandas as pd
 from urllib.parse import quote, urlparse
@@ -17,12 +20,33 @@ from docx.oxml.ns import qn
 from docx.shared import Pt              # betűméret
 from docx.enum.text import WD_BREAK     # oldaltörés
 
+# ======= Opcionális Gemini (link-keresőhöz) =======
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+try:
+    import google.generativeai as genai
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+    else:
+        _GEMINI_MODEL = None
+except Exception:
+    _GEMINI_MODEL = None
+
 # ===== Konfiguráció =====
 TEMPLATE_PATH = "ceges_sablon.docx"
 REQUIRED_COLS = {"Rovat", "Link"}
 APP_SECRET = "007"     # egyezzen az Apps Scriptben
 
 app = FastAPI()
+
+# ===== CORS (Docs/Sheets oldalsáv miatt) =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # ha akarod, szűkítheted domainre
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ===== Segédek =====
 def csv_url(sheet_id: str, sheet_name: str) -> str:
@@ -31,10 +55,8 @@ def csv_url(sheet_id: str, sheet_name: str) -> str:
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
-# mondatzáró jel
 SENT_END_RE = re.compile(r'[.!?…]"?$')
 
-# reklám/junk minták
 AD_PATTERNS = [
     r"^\s*hirdet[ée]s\b", r"^\s*szponzor[áa]lt\b", r"^\s*t[áa]mogatott tartalom\b",
     r"^\s*aj[áa]nl[oó]\b", r"^\s*kapcsol[óo]d[óo].*", r"^\s*olvasta m[áa]r\??",
@@ -45,7 +67,7 @@ AD_PATTERNS = [
     r"^érdekesnek találta.*hírlevelünkre", r"^\s*hírlev[ée]l",
     r"^\s*kapcsol[óo]d[óo] cikk(ek)?\b", r"^\s*fot[óo]gal[ée]ria\b",
     r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
-    r"^\s*Csapjunk bele a közepébe",   # Portfolio "hirtelen kezdés"
+    r"^\s*Csapjunk bele a közepébe",
     r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
 ]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
@@ -55,15 +77,13 @@ def is_sentence_like(s: str) -> bool:
     return bool(SENT_END_RE.search(s)) or len(s) > 200
 
 def clean_and_merge(paras: list[str]) -> list[str]:
-    """Bekezdések tisztítása és teljes mondatokra fűzése."""
     lines = []
     for p in paras:
         t = norm_space(p)
-        if not t:
+        if not t: 
             continue
         if JUNK_RE.search(t):
             continue
-        # nagyon rövid, feltehetően alcím – kihagyjuk
         if len(t) < 35 and not t.endswith(":"):
             continue
         lines.append(t)
@@ -72,9 +92,7 @@ def clean_and_merge(paras: list[str]) -> list[str]:
     for t in lines:
         buf = f"{buf} {t}".strip() if buf else t
         if is_sentence_like(buf):
-            merged.append(buf)
-            buf = ""
-    # ha maradt valami hosszabb a pufferben, engedjük át
+            merged.append(buf); buf = ""
     if buf and len(buf) > 60:
         merged.append(buf)
 
@@ -82,7 +100,6 @@ def clean_and_merge(paras: list[str]) -> list[str]:
     return merged
 
 def add_bm(paragraph, name: str):
-    """Belső könyvjelző beszúrása."""
     run = paragraph.add_run()
     r = run._r
     bs = OxmlElement('w:bookmarkStart'); bs.set(qn('w:id'), '1'); bs.set(qn('w:name'), name)
@@ -90,7 +107,6 @@ def add_bm(paragraph, name: str):
     r.append(bs); r.append(be)
 
 def add_link(paragraph, text: str, anchor: str):
-    """Belső hivatkozás beszúrása (anchor = könyvjelző neve)."""
     h = OxmlElement('w:hyperlink'); h.set(qn('w:anchor'), anchor)
     r = OxmlElement('w:r'); rPr = OxmlElement('w:rPr')
     u = OxmlElement('w:u'); u.set(qn('w:val'), 'single'); rPr.append(u)
@@ -101,7 +117,7 @@ def add_link(paragraph, text: str, anchor: str):
 def hu_date(d: datetime.date) -> str:
     return d.strftime("%Y.%m.%d.")
 
-# ===== Cikk kinyerés =====
+# ===== Cikk kinyerés (meglévő logika) =====
 def read_paras(url: str):
     # 1) Readability
     try:
@@ -146,7 +162,6 @@ def read_paras(url: str):
         return "", []
 
 def pick_lead(paras: list[str]) -> str:
-    """Az első 1–2 TELJES mondat a bevezetőhöz – félmondatot nem hagyunk."""
     if not paras:
         return ""
     text = paras[0]
@@ -159,21 +174,31 @@ def pick_lead(paras: list[str]) -> str:
         lead = f"{lead} {parts[1]}"
     return lead.strip()
 
-# ===== Payload =====
-class Payload(BaseModel):
+# ===== Payloadok =====
+class GeneratePayload(BaseModel):
     sheet_id: str
     worksheet: str
     rovat: str
     secret: str | None = None
 
-# ===== Endpoint =====
+class ChatPayload(BaseModel):
+    rovat: str
+    query: str
+    date_from: str    # "YYYY-MM-DD"
+    date_to: str      # "YYYY-MM-DD"
+    n: int | None = 10
+
+# ===== Health =====
+@app.get("/health")
+def health():
+    return {"ok": True, "gemini": bool(_GEMINI_MODEL)}
+
+# ===== DOCX generátor (változatlan működés) =====
 @app.post("/generate")
-def generate(p: Payload):
-    # auth
+def generate(p: GeneratePayload):
     if APP_SECRET and (p.secret != APP_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # sheet beolvasás
     try:
         df = pd.read_csv(csv_url(p.sheet_id, p.worksheet))
     except Exception as e:
@@ -185,17 +210,16 @@ def generate(p: Payload):
 
     df = df.dropna(subset=["Rovat", "Link"])
     df = df[df["Rovat"].astype(str).str.strip() == p.rovat]
-    df = df[df["Link"].astype(str).str.startswith(("http://", "https://"), na=False)]
+    df = df[df["Link"].astype(str).str.startswith(("http://","https://"), na=False)]
     if df.empty:
         raise HTTPException(status_code=404, detail=f"No links for rovat '{p.rovat}' on sheet '{p.worksheet}'")
 
-    # DOCX indul
     doc = Document(TEMPLATE_PATH) if os.path.exists(TEMPLATE_PATH) else Document()
 
-    # Főcím – félkövér + Heading 1
+    # Főcím
     title_p = doc.add_paragraph()
     try:
-        title_p.style = 'Heading 1'  # legyen a sablonban!
+        title_p.style = 'Heading 1'
     except Exception:
         pass
     run = title_p.add_run(f"Weekly News | {p.rovat}")
@@ -226,12 +250,10 @@ def generate(p: Payload):
             u = urlparse(url)
             title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # félkövér cím sor
         intro_line = doc.add_paragraph()
         r = intro_line.add_run(f"{i+1}. {title}")
         r.bold = True
 
-        # lead (1–2 teljes mondat)
         lead = pick_lead(paras)
         if lead:
             doc.add_paragraph(lead)
@@ -246,7 +268,7 @@ def generate(p: Payload):
     except Exception:
         pass
 
-    # „Articles” cím – félkövér + Heading 2
+    # „Articles”
     sec = doc.add_paragraph()
     try:
         sec.style = 'Heading 2'
@@ -263,7 +285,6 @@ def generate(p: Payload):
             u = urlparse(url)
             title = f"{u.netloc}{u.path}".strip("/") or "Cím nélkül"
 
-        # Cikk cím – félkövér + Heading 2 + könyvjelző
         ptitle = doc.add_paragraph()
         try:
             ptitle.style = 'Heading 2'
@@ -273,32 +294,104 @@ def generate(p: Payload):
         rr = ptitle.add_run(title)
         rr.bold = True
 
-        # Forrás
         dom = urlparse(url).netloc.lower().replace("www.", "")
         doc.add_paragraph(f"Source: {dom}")
 
-        # Törzs
         for para in paras:
             doc.add_paragraph(para)
 
-        # Vissza az intróhoz
         back = doc.add_paragraph()
         add_link(back, "back to intro >>>", "INTRO")
 
-        # Oldaltörés cikkek között
         if i != len(rows) - 1:
             try:
                 doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
             except Exception:
                 pass
 
-    # Visszaküldés
     fname = f"BN_{p.rovat} news_{monday.strftime('%Y%m%d')}.docx"
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0)
     return Response(
         content=buf.read(),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"X-Filename": fname}
     )
+
+# ===== Gemini-alapú link-kereső =====
+def _build_links_prompt(rovat: str, q: str, date_from: str, date_to: str, n: int) -> str:
+    return f"""
+Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:
+[
+  {{ "title": "cikk címe", "url": "https://...", "source": "domain.tld", "published": "YYYY-MM-DD" }},
+  ...
+]
+
+Követelmények:
+- Pontosan {n} különböző link.
+- Időablak: CSAK a megadott tartományból (FROM..TO, ISO dátum).
+- Forrásminőség: preferált hírportálok (portfolio.hu, vg.hu, g7.hu, hvg.hu, telex.hu, index.hu, reuters.com, bloomberg.com, ft.com, apnews.com, stb.).
+- Kerüld: PR/advertorial, paywall preview, duplikált átvételek.
+- Téma: igazodjon a rovat témájához: "{rovat}".
+- Nyelv: magyar vagy angol.
+- Strict JSON – semmi magyarázat.
+
+Paraméterek:
+- ROVAT = "{rovat}"
+- FROM  = {date_from}
+- TO    = {date_to}
+- QUERY = {q}
+"""
+
+_URL_RE = re.compile(r"^https?://", re.I)
+
+@app.post("/chat")
+def chat(p: ChatPayload):
+    if not _GEMINI_MODEL:
+        raise HTTPException(503, "Gemini API key missing on server.")
+
+    n = max(1, min(int(p.n or 10), 20))
+    prompt = _build_links_prompt(p.rovat.strip(), p.query.strip(), p.date_from.strip(), p.date_to.strip(), n)
+
+    try:
+        resp = _GEMINI_MODEL.generate_content(prompt)
+        txt = (resp.text or "").strip()
+    except Exception as e:
+        raise HTTPException(500, f"Gemini error: {e}")
+
+    # Próbáljuk JSON-ként értelmezni – a modellnek strict JSON-t kértünk
+    import json
+    try:
+        items = json.loads(txt)
+        if not isinstance(items, list):
+            raise ValueError("Not a list")
+    except Exception:
+        raise HTTPException(502, "Model returned non-JSON output.")
+
+    # Szűrés és normalizálás
+    out = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict): 
+            continue
+        url = (it.get("url") or "").strip()
+        title = (it.get("title") or "").strip()
+        source = (it.get("source") or "").strip()
+        published = (it.get("published") or "").strip()
+        if not url or not _URL_RE.match(url): 
+            continue
+        if url in seen: 
+            continue
+        seen.add(url)
+        if not source:
+            try:
+                source = urlparse(url).netloc.replace("www.","")
+            except Exception:
+                source = ""
+        out.append({"title": title, "url": url, "source": source, "published": published})
+        if len(out) >= n:
+            break
+
+    if not out:
+        raise HTTPException(404, "No links produced by model.")
+
+    return {"ok": True, "items": out}
