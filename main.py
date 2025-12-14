@@ -16,16 +16,26 @@ import os, io, re, datetime, requests, pandas as pd
 import trafilatura
 
 # ===================== Opcionális Gemini =====================
+# ======= Opcionális Gemini (link-keresőhöz) =======
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
 try:
     import google.generativeai as genai
-    if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
-        _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
-    else:
-        _GEMINI_MODEL = None
 except Exception:
-    _GEMINI_MODEL = None
+    genai = None
+
+_GEMINI_MODEL = None
+if GEMINI_API_KEY and genai is not None:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        try:
+            # Elsődleges (gyorsabb/olcsóbb)
+            _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash-latest")
+        except Exception:
+            # Fallback, ha a flash-latest nem érhető el a kulcsodon
+            _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-pro-latest")
+    except Exception:
+        _GEMINI_MODEL = None
 
 # ===================== Konfiguráció ==========================
 TEMPLATE_PATH = "ceges_sablon.docx"
