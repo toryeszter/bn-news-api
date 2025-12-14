@@ -1,26 +1,21 @@
 # main.py – BN News DOCX generátor + AI link-kereső (FastAPI)
-# --------------------------------------------------------------------------------
-# /generate  -> DOCX (a meglévő működésed változatlanul megmarad)
-# /chat      -> Gemini 1.5 Flash segítségével JSON link-lista (csak ha van GEMINI_API_KEY)
-# /health    -> állapot teszt
-# --------------------------------------------------------------------------------
 
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os, io, re, datetime, requests, pandas as pd
 from urllib.parse import quote, urlparse
-from readability import Document as ReadabilityDoc
+from datetime import date, timedelta
 from lxml import html
-import trafilatura
-
+from readability import Document as ReadabilityDoc
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt              # betűméret
-from docx.enum.text import WD_BREAK     # oldaltörés
+from docx.shared import Pt
+from docx.enum.text import WD_BREAK
+import os, io, re, datetime, requests, pandas as pd
+import trafilatura
 
-# ======= Opcionális Gemini (link-keresőhöz) =======
+# ===================== Opcionális Gemini =====================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 try:
     import google.generativeai as genai
@@ -32,23 +27,21 @@ try:
 except Exception:
     _GEMINI_MODEL = None
 
-# ===== Konfiguráció =====
+# ===================== Konfiguráció ==========================
 TEMPLATE_PATH = "ceges_sablon.docx"
 REQUIRED_COLS = {"Rovat", "Link"}
-APP_SECRET = "007"     # egyezzen az Apps Scriptben
+APP_SECRET = "007"
 
 app = FastAPI()
-
-# ===== CORS (Docs/Sheets oldalsáv miatt) =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # ha akarod, szűkítheted domainre
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Segédek =====
+# ===================== Segédek ===============================
 def csv_url(sheet_id: str, sheet_name: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
 
@@ -80,7 +73,7 @@ def clean_and_merge(paras: list[str]) -> list[str]:
     lines = []
     for p in paras:
         t = norm_space(p)
-        if not t: 
+        if not t:
             continue
         if JUNK_RE.search(t):
             continue
@@ -92,7 +85,8 @@ def clean_and_merge(paras: list[str]) -> list[str]:
     for t in lines:
         buf = f"{buf} {t}".strip() if buf else t
         if is_sentence_like(buf):
-            merged.append(buf); buf = ""
+            merged.append(buf)
+            buf = ""
     if buf and len(buf) > 60:
         merged.append(buf)
 
@@ -117,12 +111,9 @@ def add_link(paragraph, text: str, anchor: str):
 def hu_date(d: datetime.date) -> str:
     return d.strftime("%Y.%m.%d.")
 
-from datetime import date, timedelta
-
 def monday_of(isodate_str: str) -> date:
     y, m, d = [int(x) for x in isodate_str.split("-")]
     dt = date(y, m, d)
-    # biztosítsuk, hogy tényleg hétfő legyen (ha valaki véletlen más napra nevezte el)
     return dt if dt.weekday() == 0 else (dt - timedelta(days=dt.weekday()))
 
 def week_range_from_monday(monday: date):
@@ -135,7 +126,7 @@ def last_7_days():
     start = today - timedelta(days=6)
     return start.isoformat(), today.isoformat()
 
-# ===== Cikk kinyerés (meglévő logika) =====
+# ===================== Cikk kinyerés =========================
 def read_paras(url: str):
     # 1) Readability
     try:
@@ -192,7 +183,7 @@ def pick_lead(paras: list[str]) -> str:
         lead = f"{lead} {parts[1]}"
     return lead.strip()
 
-# ===== Payloadok =====
+# ===================== Pydantic payloadok ====================
 class GeneratePayload(BaseModel):
     sheet_id: str
     worksheet: str
@@ -200,98 +191,21 @@ class GeneratePayload(BaseModel):
     secret: str | None = None
 
 class ChatPayload(BaseModel):
-    # a Sheets most ezeket küldi:
     sheet_id: str | None = None
     worksheet: str | None = None
     rovat: str
     query: str | None = ""
     use_emis: bool | None = False
-    # opcionálisan küldhető közvetlen dátumablak is:
     date_from: str | None = None
     date_to: str | None = None
     n: int | None = 10
 
-    # 1) dátumablak meghatározás
-    if p.date_from and p.date_to:
-        d_from, d_to = p.date_from.strip(), p.date_to.strip()
-    elif p.worksheet:
-        try:
-            mon = monday_of(p.worksheet.strip())
-            d_from, d_to = week_range_from_monday(mon)  # hétfő–vasárnap
-        except Exception:
-            d_from, d_to = last_7_days()
-    else:
-        d_from, d_to = last_7_days()
-
-    # 2) elemszám
-    n = max(1, min(int(p.n or 10), 20))
-
-    # 3) prompt
-    prompt = _build_links_prompt(
-        rovat=p.rovat.strip(),
-        q=(p.query or "").strip(),
-        date_from=d_from,
-        date_to=d_to,
-        n=n
-    )
-
-    # 4) modell hívás
-    try:
-        resp = _GEMINI_MODEL.generate_content(prompt)
-        txt = (resp.text or "").strip()
-    except Exception as e:
-        raise HTTPException(500, f"Gemini error: {e}")
-
-    # 5) JSON értelmezés
-    import json
-    try:
-        items = json.loads(txt)
-        if not isinstance(items, list):
-            raise ValueError("Not a list")
-    except Exception:
-        raise HTTPException(502, "Model returned non-JSON output.")
-
-    # 6) szűrés/normalizálás és a kívánt kulcsnév: 'sources'
-    out = []
-    seen = set()
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        url = (it.get("url") or "").strip()
-        title = (it.get("title") or "").strip()
-        source = (it.get("source") or "").strip()
-        published = (it.get("published") or "").strip()
-        if not url or not _URL_RE.match(url):
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        if not source:
-            try:
-                source = urlparse(url).netloc.replace("www.", "")
-            except Exception:
-                source = ""
-        out.append({
-            "title": title,
-            "url": url,
-            "source": source,
-            "published": published
-        })
-        if len(out) >= n:
-            break
-
-    if not out:
-        raise HTTPException(404, "No links produced by model.")
-
-    # kompatibilitás: az Apps Script 'json.sources'-t olvas
-    return {"ok": True, "date_from": d_from, "date_to": d_to, "sources": out, "items": out}
-
-# ===== Health =====
+# ===================== Health ================================
 @app.get("/health")
 def health():
     return {"ok": True, "gemini": bool(_GEMINI_MODEL)}
 
-# ===== DOCX generátor (változatlan működés) =====
+# ===================== DOCX generátor ========================
 @app.post("/generate")
 def generate(p: GeneratePayload):
     if APP_SECRET and (p.secret != APP_SECRET):
@@ -314,7 +228,6 @@ def generate(p: GeneratePayload):
 
     doc = Document(TEMPLATE_PATH) if os.path.exists(TEMPLATE_PATH) else Document()
 
-    # Főcím
     title_p = doc.add_paragraph()
     try:
         title_p.style = 'Heading 1'
@@ -327,7 +240,6 @@ def generate(p: GeneratePayload):
     except Exception:
         pass
 
-    # Dátum
     try:
         y, m, d = [int(x) for x in p.worksheet.split("-")]
         monday = datetime.date(y, m, d)
@@ -335,12 +247,10 @@ def generate(p: GeneratePayload):
         monday = datetime.date.today()
     doc.add_paragraph(hu_date(monday))
 
-    # Intro horgony
     add_bm(doc.add_paragraph(), "INTRO")
 
     rows = df.reset_index(drop=True)
 
-    # Rövid intro blokkok
     for i, row in rows.iterrows():
         url = str(row["Link"]).strip()
         title, paras = read_paras(url)
@@ -360,13 +270,11 @@ def generate(p: GeneratePayload):
         add_link(link_p, "read article >>>", f"cikk_{i}")
         doc.add_paragraph("")
 
-    # Intro után oldaltörés
     try:
         doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
     except Exception:
         pass
 
-    # „Articles”
     sec = doc.add_paragraph()
     try:
         sec.style = 'Heading 2'
@@ -375,7 +283,6 @@ def generate(p: GeneratePayload):
     sr = sec.add_run("Articles")
     sr.bold = True
 
-    # Cikkek
     for i, row in rows.iterrows():
         url = str(row["Link"]).strip()
         title, paras = read_paras(url)
@@ -415,8 +322,9 @@ def generate(p: GeneratePayload):
         headers={"X-Filename": fname}
     )
 
-# ===== Gemini-alapú link-kereső (EGYETLEN, VÉGLEGES VERZIÓ) =====
+# ===================== Gemini link-kereső =====================
 def _build_links_prompt(rovat: str, q: str, date_from: str, date_to: str, n: int) -> str:
+    # NINCS f-string a mintában; sorokból építjük, így a kapcsos zárójelek biztonságosak
     parts = [
         "Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:",
         "[",
@@ -450,22 +358,22 @@ def chat(p: ChatPayload):
     if not _GEMINI_MODEL:
         raise HTTPException(503, "Gemini API key missing on server.")
 
-    # 1) dátumablak
+    # dátumablak
     if p.date_from and p.date_to:
         d_from, d_to = p.date_from.strip(), p.date_to.strip()
     elif p.worksheet:
         try:
             mon = monday_of(p.worksheet.strip())
-            d_from, d_to = week_range_from_monday(mon)  # hétfő–vasárnap
+            d_from, d_to = week_range_from_monday(mon)
         except Exception:
             d_from, d_to = last_7_days()
     else:
         d_from, d_to = last_7_days()
 
-    # 2) elemszám
+    # elemszám
     n = max(1, min(int(p.n or 10), 20))
 
-    # 3) prompt
+    # prompt
     prompt = _build_links_prompt(
         rovat=p.rovat.strip(),
         q=(p.query or "").strip(),
@@ -474,14 +382,18 @@ def chat(p: ChatPayload):
         n=n
     )
 
-    # 4) modell hívás
+    # hívás
     try:
         resp = _GEMINI_MODEL.generate_content(prompt)
         txt = (resp.text or "").strip()
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {e}")
 
-    # 5) JSON értelmezés
+    # kódfence lecsupaszítás (ha a modell ```json blokkot ad)
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt).strip()
+
+    # JSON parse
     import json
     try:
         items = json.loads(txt)
@@ -490,7 +402,7 @@ def chat(p: ChatPayload):
     except Exception:
         raise HTTPException(502, "Model returned non-JSON output.")
 
-    # 6) szűrés/normalizálás
+    # normalizálás
     out = []
     seen = set()
     for it in items:
@@ -517,6 +429,4 @@ def chat(p: ChatPayload):
     if not out:
         raise HTTPException(404, "No links produced by model.")
 
-    # Apps Script kompatibilitás: 'sources' kell
     return {"ok": True, "date_from": d_from, "date_to": d_to, "sources": out, "items": out}
-
