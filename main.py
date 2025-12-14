@@ -417,30 +417,29 @@ def generate(p: GeneratePayload):
 
 # ===== Gemini-alapú link-kereső (EGYETLEN, VÉGLEGES VERZIÓ) =====
 def _build_links_prompt(rovat: str, q: str, date_from: str, date_to: str, n: int) -> str:
-    return f"""
-Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:
-[
-  {{ "title": "cikk címe", "url": "https://...", "source": "domain.tld", "published": "YYYY-MM-DD" }},
-  ...
-]
+    return (
+        "Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:\n"
+        "[\n"
+        "  {{ \"title\": \"cikk címe\", \"url\": \"https://...\", \"source\": \"domain.tld\", \"published\": \"YYYY-MM-DD\" }},\n"
+        "  ...\n"
+        "]\n\n"
+        "Követelmények:\n"
+        f"- Pontosan {n} különböző link.\n"
+        "- Időablak: CSAK a megadott tartományból (FROM..TO, ISO dátum).\n"
+        "- Fókusz: Magyarországon történt, vagy Magyarországot érdemben érintő hírek.\n"
+        "- Forrásminőség: preferált portálok (portfolio.hu, vg.hu, g7.hu, hvg.hu, telex.hu, index.hu,\n"
+        "  reuters.com, bloomberg.com, ft.com, apnews.com stb.).\n"
+        "- Kerüld: PR/advertorial, paywall preview, duplikált átvételek.\n"
+        f"- Téma: igazodjon a rovat témájához: \"{rovat}\".\n"
+        "- Nyelv: magyar vagy angol.\n"
+        "- Strict JSON – semmi magyarázat.\n\n"
+        "Paraméterek:\n"
+        f"- ROVAT = \"{rovat}\"\n"
+        f"- FROM  = {date_from}\n"
+        f"- TO    = {date_to}\n"
+        f"- QUERY = {q}\n"
+    )
 
-Követelmények:
-- Pontosan {n} különböző link.
-- Időablak: CSAK a megadott tartományból (FROM..TO, ISO dátum).
-- Fókusz: Magyarországon történt, vagy Magyarországot érdemben érintő hírek.
-- Forrásminőség: preferált portálok (portfolio.hu, vg.hu, g7.hu, hvg.hu, telex.hu, index.hu,
-  reuters.com, bloomberg.com, ft.com, apnews.com stb.).
-- Kerüld: PR/advertorial, paywall preview, duplikált átvételek.
-- Téma: igazodjon a rovat témájához: "{rovat}".
-- Nyelv: magyar vagy angol.
-- Strict JSON – semmi magyarázat.
-
-Paraméterek:
-- ROVAT = "{rovat}"
-- FROM  = {date_from}
-- TO    = {date_to}
-- QUERY = {q}
-"""
 
 _URL_RE = re.compile(r"^https?://", re.I)
 
