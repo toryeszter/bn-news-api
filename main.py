@@ -12,30 +12,26 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt
 from docx.enum.text import WD_BREAK
+from google import genai  # ÚJ: Google GenAI (v3) SDK
 import os, io, re, datetime, requests, pandas as pd
 import trafilatura
+import json
 
-# ===================== Opcionális Gemini =====================
-# ======= Opcionális Gemini (link-keresőhöz) =======
+# ===================== Gemini (új Google GenAI SDK) =====================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+_GENAI_CLIENT = None
+_GEMINI_MODEL_ID = None
 
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
-
-_GEMINI_MODEL = None
-if GEMINI_API_KEY and genai is not None:
+if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        try:
-            # Elsődleges (gyorsabb/olcsóbb)
-            _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash-latest")
-        except Exception:
-            # Fallback, ha a flash-latest nem érhető el a kulcsodon
-            _GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-pro-latest")
+        _GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+        # A nálad működő modell:
+        _GEMINI_MODEL_ID = "gemini-3-flash-preview"
+        # Ha szeretnél stabil alternatívát, és elérhető az accountodon:
+        # _GEMINI_MODEL_ID = "gemini-3.0-flash"
     except Exception:
-        _GEMINI_MODEL = None
+        _GENAI_CLIENT = None
+        _GEMINI_MODEL_ID = None
 
 # ===================== Konfiguráció ==========================
 TEMPLATE_PATH = "ceges_sablon.docx"
@@ -213,7 +209,7 @@ class ChatPayload(BaseModel):
 # ===================== Health ================================
 @app.get("/health")
 def health():
-    return {"ok": True, "gemini": bool(_GEMINI_MODEL)}
+    return {"ok": True, "gemini": bool(_GENAI_CLIENT), "model": _GEMINI_MODEL_ID or ""}
 
 # ===================== DOCX generátor ========================
 @app.post("/generate")
@@ -334,7 +330,6 @@ def generate(p: GeneratePayload):
 
 # ===================== Gemini link-kereső =====================
 def _build_links_prompt(rovat: str, q: str, date_from: str, date_to: str, n: int) -> str:
-    # NINCS f-string a mintában; sorokból építjük, így a kapcsos zárójelek biztonságosak
     parts = [
         "Feladat: Adj vissza **csak egy JSON tömböt** (kódblokk és kísérőszöveg nélkül) ebben a sémában:",
         "[",
@@ -365,8 +360,8 @@ _URL_RE = re.compile(r"^https?://", re.I)
 
 @app.post("/chat")
 def chat(p: ChatPayload):
-    if not _GEMINI_MODEL:
-        raise HTTPException(503, "Gemini API key missing on server.")
+    if not _GENAI_CLIENT or not _GEMINI_MODEL_ID:
+        raise HTTPException(503, "Gemini client/model is not configured.")
 
     # dátumablak
     if p.date_from and p.date_to:
@@ -392,19 +387,21 @@ def chat(p: ChatPayload):
         n=n
     )
 
-    # hívás
+    # modell hívás (új SDK)
     try:
-        resp = _GEMINI_MODEL.generate_content(prompt)
-        txt = (resp.text or "").strip()
+        resp = _GENAI_CLIENT.models.generate_content(
+            model=_GEMINI_MODEL_ID,
+            contents=prompt
+        )
+        txt = (getattr(resp, "text", None) or "").strip()
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {e}")
 
-    # kódfence lecsupaszítás (ha a modell ```json blokkot ad)
+    # Ha a modell kódfence-ben küldi:
     if txt.startswith("```"):
         txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt).strip()
 
     # JSON parse
-    import json
     try:
         items = json.loads(txt)
         if not isinstance(items, list):
@@ -413,8 +410,7 @@ def chat(p: ChatPayload):
         raise HTTPException(502, "Model returned non-JSON output.")
 
     # normalizálás
-    out = []
-    seen = set()
+    out, seen = [], set()
     for it in items:
         if not isinstance(it, dict):
             continue
