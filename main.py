@@ -77,6 +77,7 @@ AD_PATTERNS = [
     r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
     r"^\s*Csapjunk bele a közepébe",
     r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
+    r".* – Fotó: .+$",
     # Economx specifikus
     r"A gazdaság és az üzleti élet legfrissebb hírei az Economx.hu hírlevelében",
     r"Küldtünk Önnek egy emailt!",
