@@ -40,7 +40,7 @@ if GEMINI_API_KEY:
 
 app = FastAPI()
 
-# ===== 3. REKLÁM ÉS JUNK SZŰRŐK (Minden kért elem benne van) =====
+# ===== 3. REKLÁM ÉS JUNK SZŰRŐK (Eredeti + Új kérések) =====
 
 AD_PATTERNS = [
     r"^\s*hirdet[ée]s\b",
@@ -65,93 +65,51 @@ AD_PATTERNS = [
     r"^\s*tov[áa]bbi (h[íi]reink|cikkek)\b",
     r"^\s*Csapjunk bele a közepébe",
     r"A cikk elkészítésében .* Alrite .* alkalmazás támogatta a munkánkat\.?$",
-    # Economx specifikus törlendő sorok:
+    # Economx specifikus
     r"A gazdaság és az üzleti élet legfrissebb hírei az Economx.hu hírlevelében",
     r"Küldtünk Önnek egy emailt!",
     r"feliratkozása megerősítéséhez"
 ]
 JUNK_RE = re.compile("|".join(AD_PATTERNS), flags=re.IGNORECASE)
+SENT_END_RE = re.compile(r'[.!?…]"?$')
 
-# ===== 4. AI KERESŐ (Gemini 1.5 Flash + Search) =====
-
-def perform_gemini_search(rovat: str, start_date: str, end_date: str):
-    if not GEMINI_API_KEY:
-        return [{"title": "Hiba: Hiányzó GEMINI_API_KEY a szerveren!", "url": ""}]
-
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    prompt = f"""
-    Feladat: Keress 6-10 releváns magyar nyelvű gazdasági hírt a '{rovat}' témában.
-    Időszak: {start_date} és {end_date} között publikált cikkek.
-    Források: vg.hu, economx.hu, portfolio.hu, telex.hu, hvg.hu.
-    
-    A választ KIZÁRÓLAG egy JSON listaként add meg:
-    [
-      {{"title": "Cikk pontos címe", "url": "https://link-a-cikkre.hu"}},
-      ...
-    ]
-    """
-
-    try:
-        response = model.generate_content(prompt)
-        match = re.search(r'\[.*\]', response.text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return []
-    except Exception as e:
-        print(f"Gemini hiba: {e}")
-        return []
-
-@app.post("/chat")
-def chat_endpoint(p: ChatPayload):
-    if APP_SECRET and (p.secret != APP_SECRET):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    try:
-        ref_date = datetime.datetime.strptime(p.worksheet, "%Y-%m-%d")
-        start_dt = (ref_date - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-        end_dt = (ref_date - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    except:
-        start_dt, end_dt = "last 7 days", "today"
-
-    found_sources = perform_gemini_search(p.rovat, start_dt, end_dt)
-    return {"sources": found_sources}
-
-# ===== 5. TISZTÍTÁS ÉS KINYERÉS (VG.hu felsorolás-fixszel) =====
+# ===== 4. SEGÉDFÜGGVÉNYEK (Visszaállítva az eredeti stabil verzióra) =====
 
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
+def is_sentence_like(s: str) -> bool:
+    s = s.strip()
+    return bool(SENT_END_RE.search(s)) or len(s) > 200
+
 def clean_and_merge(paras: list[str]) -> list[str]:
+    """Az eredeti, bevált tisztítási logika."""
     lines = []
     for p in paras:
         t = norm_space(p)
         if not t or JUNK_RE.search(t):
             continue
-        # Rövid sorok kezelése: megtartjuk, ha felsorolás (•) vagy alcímszerű (:)
-        if len(t) > 35 or t.startswith("•") or t.endswith(":"):
-            lines.append(t)
-    
+        # Felsorolások miatt a VG.hu-nál engedékenyebb hossz
+        if len(t) < 35 and not t.endswith(":"):
+            continue
+        lines.append(t)
+
     merged, buf = [], ""
     for t in lines:
-        if t.startswith("•"):
-            if buf: merged.append(buf)
-            merged.append(t)
-            buf = ""
-            continue
         buf = f"{buf} {t}".strip() if buf else t
-        if len(buf) > 160 or (buf and buf[-1] in ".!?…"):
+        if is_sentence_like(buf):
             merged.append(buf)
             buf = ""
-    if buf: merged.append(buf)
-    return merged
+    if buf and len(buf) > 60:
+        merged.append(buf)
+    return [m for m in merged if not JUNK_RE.search(m)]
 
 def fallback_html_parser(html_content: str):
-    """Kényszerített kinyerés a VG.hu-s felsorolásokhoz."""
+    """Extra védelem a VG.hu listákhoz, ha az alap kinyerés elbukna."""
     try:
         tree = html.fromstring(html_content)
-        main_content = tree.xpath("//article | //div[contains(@class, 'content')] | //div[contains(@class, 'article')]")
-        target = main_content[0] if main_content else tree
+        main = tree.xpath("//article | //div[contains(@class, 'content')] | //div[contains(@class, 'article')]")
+        target = main[0] if main else tree
         extracted = []
         for el in target.xpath(".//p | .//li"):
             text = norm_space(el.text_content())
@@ -162,32 +120,83 @@ def fallback_html_parser(html_content: str):
     except: return []
 
 def read_paras(url: str):
-    title, paras = "", []
+    """Visszaállítva az eredeti kettős (Readability + Trafilatura) logika."""
+    # 1) Readability
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        raw_html = r.text
-        rd = ReadabilityDoc(raw_html)
-        title = rd.short_title()
+        rd = ReadabilityDoc(r.text)
+        title = (rd.short_title() or "").strip()
+        root = html.fromstring(rd.summary())
+        paras = [norm_space(el.text_content()) for el in root.xpath(".//p")]
         
-        text = trafilatura.extract(raw_html, include_tables=True, favor_recall=True)
-        if text:
-            paras = [p for p in text.split("\n") if p.strip()]
-        
-        # Ha VG.hu vagy gyanúsan kevés szöveg, jön a biztosabb parser
-        if len(paras) < 5 or "vg.hu" in url:
-            paras = fallback_html_parser(raw_html)
-    except: pass
-    return title, clean_and_merge(paras)
+        # Speciális eset: ha VG.hu, akkor a listákat is behúzzuk
+        if "vg.hu" in url:
+            paras = fallback_html_parser(r.text)
 
-# ===== 6. DOCX GENERÁLÁS ÉS SEGÉDEK =====
+        cleaned = clean_and_merge(paras)
+        if cleaned:
+            return title, cleaned
+    except: pass
+
+    # 2) Trafilatura fallback
+    try:
+        dl = trafilatura.fetch_url(url)
+        text = trafilatura.extract(dl, include_comments=False, include_tables=True, favor_recall=True)
+        paras = []
+        if text:
+            blocks = [norm_space(b) for b in re.split(r"\n\s*\n", text.replace("\r\n", "\n"))]
+            paras = [b for b in blocks if b]
+        
+        title = ""
+        try:
+            meta = trafilatura.extract_metadata(dl)
+            if meta and getattr(meta, "title", None):
+                title = meta.title.strip()
+        except: pass
+        
+        return title, clean_and_merge(paras)
+    except:
+        return "", []
+
+def pick_lead(paras: list[str]) -> str:
+    if not paras: return ""
+    text = paras[0]
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    lead = parts[0] if parts else text
+    if len(parts) >= 2 and len(lead) < 220:
+        lead = f"{lead} {parts[1]}"
+    return lead.strip()
+
+# ===== 5. AI KERESŐ (Gemini 1.5 Flash) =====
+
+def perform_gemini_search(rovat: str, start_date: str, end_date: str):
+    if not GEMINI_API_KEY:
+        return [{"title": "HIÁNYZIK AZ API KULCS!", "url": ""}]
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    prompt = f"Magyar gazdasági hírek JSON listaként (title, url) a(z) {rovat} témában {start_date} és {end_date} között."
+    try:
+        response = model.generate_content(prompt)
+        match = re.search(r'\[.*\]', response.text, re.DOTALL)
+        return json.loads(match.group()) if match else []
+    except: return []
+
+@app.post("/chat")
+def chat_endpoint(p: ChatPayload):
+    if APP_SECRET and (p.secret != APP_SECRET): raise HTTPException(status_code=401)
+    try:
+        ref = datetime.datetime.strptime(p.worksheet, "%Y-%m-%d")
+        s, e = (ref - datetime.timedelta(days=7)).strftime("%Y-%m-%d"), (ref - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    except: s, e = "utóbbi 7 nap", "ma"
+    return {"sources": perform_gemini_search(p.rovat, s, e)}
+
+# ===== 6. DOCX ÉS ENDPOINT (Eredeti stílus) =====
 
 def add_bm(paragraph, name: str):
     run = paragraph.add_run()
     r = run._r
     bs, be = OxmlElement("w:bookmarkStart"), OxmlElement("w:bookmarkEnd")
-    bs.set(qn("w:id"), "1"); bs.set(qn("w:name"), name)
-    be.set(qn("w:id"), "1")
+    bs.set(qn("w:id"), "1"); bs.set(qn("w:name"), name); be.set(qn("w:id"), "1")
     r.append(bs); r.append(be)
 
 def add_link(paragraph, text: str, anchor: str):
@@ -200,58 +209,42 @@ def add_link(paragraph, text: str, anchor: str):
 
 @app.post("/generate")
 def generate(p: Payload):
-    if APP_SECRET and (p.secret != APP_SECRET):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
+    if APP_SECRET and (p.secret != APP_SECRET): raise HTTPException(status_code=401)
     try:
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{p.sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(p.worksheet)}"
-        df = pd.read_csv(sheet_url).dropna(subset=["Rovat", "Link"])
+        csv_path = f"https://docs.google.com/spreadsheets/d/{p.sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(p.worksheet)}"
+        df = pd.read_csv(csv_path).dropna(subset=["Rovat", "Link"])
         df = df[df["Rovat"].astype(str).str.strip() == p.rovat]
-        rows = df.reset_index(drop=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Sheet hiba: {e}")
-
-    if rows.empty:
-        raise HTTPException(status_code=404, detail="Nincs adat ehhez a rovathoz.")
+    except Exception as e: raise HTTPException(status_code=400, detail=str(e))
 
     doc = Document(TEMPLATE_PATH) if os.path.exists(TEMPLATE_PATH) else Document()
     doc.add_paragraph(f"Weekly News | {p.rovat}").bold = True
-    doc.add_paragraph(f"Sheet: {p.worksheet}")
+    doc.add_paragraph(p.worksheet)
     add_bm(doc.add_paragraph(), "INTRO")
 
     articles = []
-    for i, row in rows.iterrows():
-        t, p_list = read_paras(str(row["Link"]))
-        articles.append({"title": t or "Cím nélkül", "url": row["Link"], "paras": p_list})
+    for i, row in df.iterrows():
+        t, ps = read_paras(str(row["Link"]))
+        articles.append({"title": t or "Cím nélkül", "url": row["Link"], "paras": ps})
 
-    # Intro (Kivonat)
     for i, a in enumerate(articles):
         p_i = doc.add_paragraph()
         p_i.add_run(f"{i+1}. {a['title']}").bold = True
-        if a["paras"]:
-            doc.add_paragraph(a["paras"][0][:250] + "...")
+        lead = pick_lead(a["paras"])
+        if lead: doc.add_paragraph(lead)
         add_link(doc.add_paragraph(), "read article >>>", f"cikk_{i}")
 
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
-    # Cikkek törzse
     for i, a in enumerate(articles):
         tp = doc.add_paragraph()
         add_bm(tp, f"cikk_{i}")
         tp.add_run(a["title"]).bold = True
         doc.add_paragraph(f"Source: {urlparse(str(a['url'])).netloc}")
-        for txt in a["paras"]:
-            doc.add_paragraph(txt)
-        back = doc.add_paragraph()
-        add_link(back, "back to intro >>>", "INTRO")
-        if i < len(articles) - 1:
-            doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+        for para in a["paras"]: doc.add_paragraph(para)
+        add_link(doc.add_paragraph(), "back to intro >>>", "INTRO")
+        if i < len(articles)-1: doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
-    return Response(
-        content=buf.read(),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"X-Filename": f"BN_{p.rovat}_{p.worksheet}.docx"}
-    )
+    return Response(content=buf.read(), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"X-Filename": f"BN_{p.rovat}.docx"})
