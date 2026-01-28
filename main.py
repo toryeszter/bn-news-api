@@ -12,7 +12,7 @@ from docx.shared import Pt
 from docx.enum.text import WD_BREAK
 import os, io, re, datetime, requests, pandas as pd
 import trafilatura
-import google.generativeai as genai
+#import google.generativeai as genai
 import json
 
 # ===== Konfiguráció =====
@@ -21,8 +21,8 @@ REQUIRED_COLS = {"Rovat", "Link"}
 APP_SECRET = "007"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+#if GEMINI_API_KEY:
+    #genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
 
